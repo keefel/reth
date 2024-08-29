@@ -171,7 +171,7 @@ where
     }
 
     /// Enable prefetch.
-    pub fn enable_prefetch(mut self) -> Self {
+    pub const fn enable_prefetch(mut self) -> Self {
         self.enable_prefetch = true;
         self
     }

@@ -69,6 +69,7 @@ impl AppendableChain {
     ///
     /// if [`BlockValidationKind::Exhaustive`] is specified, the method will verify the state root
     /// of the block.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_canonical_fork<DB, E>(
         block: SealedBlockWithSenders,
         parent_header: &SealedHeader,
@@ -110,6 +111,7 @@ impl AppendableChain {
     /// Create a new chain that forks off of an existing sidechain.
     ///
     /// This differs from [`AppendableChain::new_canonical_fork`] in that this starts a new fork.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_chain_fork<DB, E>(
         &self,
         block: SealedBlockWithSenders,
@@ -176,6 +178,7 @@ impl AppendableChain {
     ///   - [`BlockAttachment`] represents if the block extends the canonical chain, and thus we can
     ///     cache the trie state updates.
     ///   - [`BlockValidationKind`] determines if the state root __should__ be validated.
+    #[allow(clippy::too_many_arguments)]
     fn validate_and_execute<EDP, DB, E>(
         block: SealedBlockWithSenders,
         parent_block: &SealedHeader,
@@ -216,7 +219,7 @@ impl AppendableChain {
         let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
 
         let (prefetch_tx, interrupt_tx) =
-            if enable_prefetch { Self::setup_prefetch(externals)? } else { (None, None) };
+            if enable_prefetch { Self::setup_prefetch(externals) } else { (None, None) };
 
         let db = StateProviderDatabase::new(&provider);
         let executor = externals.executor_factory.executor(db, prefetch_tx);
@@ -334,13 +337,10 @@ impl AppendableChain {
 
     fn setup_prefetch<DB, E>(
         externals: &TreeExternals<DB, E>,
-    ) -> Result<
-        (
-            Option<tokio::sync::mpsc::UnboundedSender<EvmState>>,
-            Option<tokio::sync::oneshot::Sender<()>>,
-        ),
-        BlockExecutionError,
-    >
+    ) -> (
+        Option<tokio::sync::mpsc::UnboundedSender<EvmState>>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    )
     where
         DB: Database + Clone + 'static,
         E: BlockExecutorProvider,
@@ -349,15 +349,21 @@ impl AppendableChain {
         let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
 
         let mut trie_prefetch = TriePrefetch::new();
-        let consistent_view =
-            Arc::new(ConsistentDbView::new_with_latest_tip(externals.provider_factory.clone())?);
+        let consistent_view = if let Ok(view) =
+            ConsistentDbView::new_with_latest_tip(externals.provider_factory.clone())
+        {
+            view
+        } else {
+            tracing::debug!("Failed to create consistent view for trie prefetch");
+            return (None, None)
+        };
 
         tokio::spawn({
             async move {
-                trie_prefetch.run::<DB>(consistent_view, prefetch_rx, interrupt_rx).await;
+                trie_prefetch.run::<DB>(Arc::new(consistent_view), prefetch_rx, interrupt_rx).await;
             }
         });
 
-        Ok((Some(prefetch_tx), Some(interrupt_tx)))
+        (Some(prefetch_tx), Some(interrupt_tx))
     }
 }
