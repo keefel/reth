@@ -22,16 +22,14 @@ use reth_provider::{
     providers::{BundleStateProvider, ConsistentDbView},
     FullExecutionDataProvider, ProviderError, StateRootProvider,
 };
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{database::StateProviderDatabase, primitives::EvmState};
 use reth_trie::updates::TrieUpdates;
 use reth_trie_parallel::parallel_root::ParallelStateRoot;
-#[cfg(feature = "prefetch")]
 use reth_trie_prefetch::TriePrefetch;
-#[cfg(feature = "prefetch")]
-use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashMap},
     ops::{Deref, DerefMut},
+    sync::Arc,
     time::Instant,
 };
 
@@ -79,6 +77,7 @@ impl AppendableChain {
         externals: &TreeExternals<DB, E>,
         block_attachment: BlockAttachment,
         block_validation_kind: BlockValidationKind,
+        enable_prefetch: bool,
     ) -> Result<Self, InsertBlockErrorKind>
     where
         DB: Database + Clone + 'static,
@@ -102,6 +101,7 @@ impl AppendableChain {
             externals,
             block_attachment,
             block_validation_kind,
+            enable_prefetch,
         )?;
 
         Ok(Self { chain: Chain::new(vec![block], bundle_state, trie_updates) })
@@ -118,6 +118,7 @@ impl AppendableChain {
         canonical_fork: ForkBlock,
         externals: &TreeExternals<DB, E>,
         block_validation_kind: BlockValidationKind,
+        enable_prefetch: bool,
     ) -> Result<Self, InsertBlockErrorKind>
     where
         DB: Database + Clone + 'static,
@@ -149,6 +150,7 @@ impl AppendableChain {
             externals,
             BlockAttachment::HistoricalFork,
             block_validation_kind,
+            enable_prefetch,
         )?;
         // extending will also optimize few things, mostly related to selfdestruct and wiping of
         // storage.
@@ -182,6 +184,7 @@ impl AppendableChain {
         externals: &TreeExternals<DB, E>,
         block_attachment: BlockAttachment,
         block_validation_kind: BlockValidationKind,
+        enable_prefetch: bool,
     ) -> Result<(ExecutionOutcome, Option<TrieUpdates>), BlockExecutionError>
     where
         EDP: FullExecutionDataProvider,
@@ -212,34 +215,14 @@ impl AppendableChain {
 
         let provider = BundleStateProvider::new(state_provider, bundle_state_data_provider);
 
-        #[cfg(feature = "prefetch")]
-        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (prefetch_tx, interrupt_tx) =
+            if enable_prefetch { Self::setup_prefetch(externals)? } else { (None, None) };
 
         let db = StateProviderDatabase::new(&provider);
-        #[cfg(feature = "prefetch")]
-        let executor = externals.executor_factory.executor(db, Some(prefetch_tx));
-        #[cfg(not(feature = "prefetch"))]
-        let executor = externals.executor_factory.executor(db, None);
+        let executor = externals.executor_factory.executor(db, prefetch_tx);
 
         let block_hash = block.hash();
         let block = block.unseal();
-
-        #[cfg(feature = "prefetch")]
-        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
-
-        #[cfg(feature = "prefetch")]
-        {
-            let mut trie_prefetch = TriePrefetch::new();
-            let consistent_view = Arc::new(ConsistentDbView::new_with_latest_tip(
-                externals.provider_factory.clone(),
-            )?);
-
-            tokio::spawn({
-                async move {
-                    trie_prefetch.run::<DB>(consistent_view, prefetch_rx, interrupt_rx).await;
-                }
-            });
-        }
 
         let state = executor.execute((&block, U256::MAX, ancestor_blocks).into())?;
         let BlockExecutionOutput { state, receipts, requests, .. } = state;
@@ -251,8 +234,9 @@ impl AppendableChain {
             ExecutionOutcome::new(state, receipts.into(), block.number, vec![requests.into()]);
 
         // stop the prefetch task.
-        #[cfg(feature = "prefetch")]
-        let _ = interrupt_tx.send(());
+        if let Some(interrupt_tx) = interrupt_tx {
+            let _ = interrupt_tx.send(());
+        }
 
         // check state root if the block extends the canonical chain __and__ if state root
         // validation was requested.
@@ -314,6 +298,7 @@ impl AppendableChain {
         canonical_fork: ForkBlock,
         block_attachment: BlockAttachment,
         block_validation_kind: BlockValidationKind,
+        enable_prefetch: bool,
     ) -> Result<(), InsertBlockErrorKind>
     where
         DB: Database + Clone + 'static,
@@ -339,10 +324,40 @@ impl AppendableChain {
             externals,
             block_attachment,
             block_validation_kind,
+            enable_prefetch,
         )?;
         // extend the state.
         self.chain.append_block(block, block_state);
 
         Ok(())
+    }
+
+    fn setup_prefetch<DB, E>(
+        externals: &TreeExternals<DB, E>,
+    ) -> Result<
+        (
+            Option<tokio::sync::mpsc::UnboundedSender<EvmState>>,
+            Option<tokio::sync::oneshot::Sender<()>>,
+        ),
+        BlockExecutionError,
+    >
+    where
+        DB: Database + Clone + 'static,
+        E: BlockExecutorProvider,
+    {
+        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+
+        let mut trie_prefetch = TriePrefetch::new();
+        let consistent_view =
+            Arc::new(ConsistentDbView::new_with_latest_tip(externals.provider_factory.clone())?);
+
+        tokio::spawn({
+            async move {
+                trie_prefetch.run::<DB>(consistent_view, prefetch_rx, interrupt_rx).await;
+            }
+        });
+
+        Ok((Some(prefetch_tx), Some(interrupt_tx)))
     }
 }
