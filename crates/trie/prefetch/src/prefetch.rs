@@ -120,8 +120,7 @@ impl TriePrefetch {
 
         // deduplicate accounts if their keys are not present in storages
         for (address, account) in &hashed_state.accounts {
-            if !hashed_state.storages.contains_key(address) &&
-                !self.cached_accounts.contains_key(address)
+            if !self.cached_accounts.contains_key(address)
             {
                 self.cached_accounts.insert(*address, true);
                 new_hashed_state.accounts.insert(*address, *account);
